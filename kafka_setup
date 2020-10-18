@@ -1,0 +1,151 @@
+Create 3 VMs that will be Kafka brokers.  (mine are 2vCPU, 4gb RAM, 250gb storage)
+
+---------------------------------------------
+Create snapshots on all 3 VMs:
+virsh snapshot-create-as --domain <vm name> --name "<snapshot name>"
+
+---------------------------------------------
+Set up Firewall for Kafka and Zookeeper:
+cat <<EOF | sudo tee /etc/firewalld/services/zookeeper.xml > /dev/null
+<?xml version="1.0" encoding="utf-8"?>
+<service>
+  <short>ZooKeeper</short>
+  <description>Firewall rule for ZooKeeper ports</description>
+  <port protocol="tcp" port="2888"/>
+  <port protocol="tcp" port="3888"/>
+  <port protocol="tcp" port="2181"/>
+</service>
+EOF
+
+sudo firewall-cmd --permanent --add-service=zookeeper 
+
+cat <<EOF | sudo tee /etc/firewalld/services/kafka.xml > /dev/null
+<?xml version="1.0" encoding="utf-8"?>
+<service>
+  <short>Kafka</short>
+  <description>Firewall rule for Kafka port</description>
+  <port protocol="tcp" port="9092"/>
+</service>
+EOF
+
+sudo firewall-cmd --permanent --add-service=kafka 
+
+sudo systemctl restart firewalld 
+sudo firewall-cmd --list-services
+#---------------------------------------
+
+Kafka Install:
+<on all 3>
+sudo yum -y install java-1.8.0-openjdk
+wget https://mirrors.ocf.berkeley.edu/apache/kafka/2.6.0/kafka_2.13-2.6.0.tgz
+tar -xzf kafka*
+
+---------------------------------------------
+Config file changes:
+
+/home/<user>/kafka_2.13-2.6.0/config/server.properties
+changes:
+broker.id=<1,2,3>
+listener=PLAINTEXT://<kafka1,2,3>:9092
+num.partitions=3
+offsets.topic.replication.factor=3
+transaction.state.log.replication.factor=3
+transaction.state.log.min.isr=3
+log.retention.hours=336 # 2 weeks
+zookeeper.connect=kafka1:2181,kafka2:2181,kafka3:2181
+---------------------------------------------
+
+/home/<user>/kafka_2.13-2.6.0/config/zookeeper.properties 
+changes:
+initLimit=5
+syncLimit=2
+server.1=kafka1:2888:3888
+server.2=kafka2:2888:3888
+server.3=kafka3:2888:3888
+# on kafka1:
+admin.enableServer=true
+admin.serverPort=8080
+
+---------------------------------------------
+For each server create a server id (1,2,3) in /tmp/zookeeper/myid
+mkdir -p /tmp/zookeeper/ && echo 1 > /tmp/zookeeper/myid
+mkdir -p /tmp/zookeeper/ && echo 2 > /tmp/zookeeper/myid
+mkdir -p /tmp/zookeeper/ && echo 3 > /tmp/zookeeper/myid
+
+---------------------------------------------
+Set SELINUX to permissive:
+/etc/selinux/config
+SELINUX=permissive
+
+---------------------------------------------
+Create services for Kafka and Zookeeper:
+
+sudo vi /etc/systemd/system/zookeeper.service
+
+[Unit]
+Description=Apache Zookeeper server
+Requires=network.target remote-fs.target
+After=network.target remote-fs.target
+[Service]
+Type=simple
+User=admin
+ExecStart=/home/admin/kafka_2.13-2.6.0/bin/zookeeper-server-start.sh /home/admin/kafka_2.13-2.6.0/config/zookeeper.properties
+ExecStop=/home/admin/kafka_2.13-2.6.0/bin/zookeeper-server-stop.sh
+Restart=on-abnormal
+[Install]
+WantedBy=multi-user.target
+
+# confirm:
+sudo systemctl daemon-reload
+sudo systemctl start zookeeper.service 
+sudo systemctl status zookeeper.service
+# enable auto-run
+sudo systemctl enable zookeeper.service
+
+sudo vi /etc/systemd/system/kafka.service
+
+[Unit]
+Description=Apache Kafka server 
+Requires=zookeeper.service
+After=zookeeper.service
+[Service]
+Type=simple
+User=admin
+ExecStart=/bin/sh -c '/home/admin/kafka_2.13-2.6.0/bin/kafka-server-start.sh /home/admin/kafka_2.13-2.6.0/config/server.properties > /home/admin/kafka_2.13-2.6.0/kafka.log 2>&1'
+ExecStop=/home/admin/kafka_2.13-2.6.0/bin/kafka-server-stop.sh
+Restart=on-abnormal
+[Install]
+WantedBy=multi-user.target
+
+# confirm:
+sudo systemctl daemon-reload
+sudo systemctl start kafka.service 
+sudo systemctl status kafka.service
+# enable auto-run
+sudo systemctl enable kafka.service
+
+# both kafka and zookeeper should now be working and auto-starting.
+
+---------------------------------------------
+# create test topic:
+On kafka1:
+/home/admin/kafka_2.13-2.6.0/bin/kafka-topics.sh --create --topic test1 --bootstrap-server kafka1:9092 --replication-factor 3 --partitions 3
+/home/admin/kafka_2.13-2.6.0/bin/kafka-topics.sh --zookeeper kafka1:2181 --describe --topic test1
+
+# write to test topic:
+On kafka2:
+/home/admin/kafka_2.13-2.6.0/bin/kafka-console-producer.sh --topic test1 --bootstrap-server kafka2:9092
+
+
+# read from topic:
+On kafka3:
+/home/admin/kafka_2.13-2.6.0/bin/kafka-console-consumer.sh --topic test1 --from-beginning --bootstrap-server kafka3:9092
+
+---------------------------------------------
+#Ensure Kafka is started (systemctl status kafka)
+#Creating a topic on the Kafka master:
+$bin/kafka-topics.sh --create --zookeeper localhost:2181 --replication-factor 3 --partitions 3 --topic <topic>
+#describe this topic
+$bin/kafka-topics.sh --describe --zookeeper localhost:2181 --topic <topic>
+#ensure messages are being delivered properly:
+bin/kafka-console-consumer.sh --bootstrap-server kafka1:9092 --topic <topic>
